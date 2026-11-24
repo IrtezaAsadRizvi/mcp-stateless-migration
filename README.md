@@ -12,11 +12,7 @@
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-2EA44F?style=flat-square)](#contributing)
 [![GitHub stars](https://img.shields.io/github/stars/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square&logo=github)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/commits)
-
-<!--
-  Uncomment after adding a LICENSE file:
-[![License](https://img.shields.io/github/license/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square)](LICENSE)
--->
+[![License: MIT](https://img.shields.io/github/license/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square)](LICENSE)
 
 **Learn stateless MCP by reading one small server, written by hand in TypeScript with no SDK, then migrating it from the old stateful protocol to the new stateless one.**
 
@@ -385,7 +381,9 @@ Issues and pull requests are welcome, especially corrections against the publish
 
 ## License
 
-<!-- TODO: add a LICENSE file. MIT is a common choice for example code. -->
+[MIT](LICENSE) © 2026 Irteza Asad Rizvi
+
+You're free to copy, modify and reuse this code in your own projects, including commercial ones. Keep the copyright notice in copies of the code.
 
 ---
 

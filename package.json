@@ -17,6 +17,7 @@
   },
   "homepage": "https://github.com/IrtezaAsadRizvi/mcp-stateless-migration#readme",
   "bugs": "https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/issues",
+  "license": "MIT",
   "type": "module",
   "private": true,
   "engines": {
