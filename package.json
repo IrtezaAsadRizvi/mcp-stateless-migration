@@ -1,0 +1,37 @@
+{
+  "name": "mcp-stateless-migration",
+  "version": "1.0.0",
+  "description": "A hand-written MCP server migrated from stateful (2025-11-25) to stateless (2026-07-28). Companion code for the article 'MCP Went Stateless. Here's How I'd Migrate a Server.'",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "stateless",
+    "mcp-server",
+    "migration",
+    "json-rpc",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IrtezaAsadRizvi/mcp-stateless-migration.git"
+  },
+  "homepage": "https://github.com/IrtezaAsadRizvi/mcp-stateless-migration#readme",
+  "bugs": "https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/issues",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start:v1": "node src/v1-stateful/main.ts",
+    "start:v2": "node src/v2-stateless/main.ts",
+    "demo:v1": "node demo/run-v1.ts",
+    "demo:v2": "node demo/run-v2.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  }
+}

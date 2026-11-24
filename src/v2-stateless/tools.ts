@@ -1,0 +1,119 @@
+// The business logic. Step 3 of the migration lives here:
+// the hidden session becomes a visible `draft_id` handle.
+
+import { randomUUID } from "node:crypto";
+import type { Store } from "./store.ts";
+import type { Channel } from "../shared/channel.ts";
+import { textContent } from "../shared/jsonrpc.ts";
+
+/** Everything a tool needs. Note: nothing here is per-connection. */
+export type ToolContext = {
+  store: Store;
+  channel: Channel;
+  principal: string; // who is calling (from the Authorization header)
+};
+
+/** What we keep in the store for each draft. */
+type Draft = { owner: string; notes: string[] };
+
+// Fixed array, fixed order: a stable tools/list keeps client prompt caches warm.
+export const toolDefinitions = [
+  {
+    name: "add_note",
+    description: "Add a line to a release notes draft. Omit draft_id to start a new draft; pass it back to keep adding.",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" }, draft_id: { type: "string" } },
+      required: ["text"],
+    },
+  },
+  {
+    name: "publish_notes",
+    description: "Publish a draft. Reusing an idempotency_key never publishes twice, so retries are safe.",
+    inputSchema: {
+      type: "object",
+      properties: { draft_id: { type: "string" }, idempotency_key: { type: "string" } },
+      required: ["draft_id", "idempotency_key"],
+    },
+  },
+];
+
+/** A tool-level error: the model sees it and can fix its own input. */
+function toolError(text: string) {
+  return { ...textContent(text), isError: true };
+}
+
+const draftKey = (id: string) => `draft:${id}`;
+
+/**
+ * Load a draft, but only if the caller owns it.
+ * Gotcha #2 from the article: handles leak into prompts and logs,
+ * so a draft_id must never be treated as proof of access.
+ */
+async function loadOwnDraft(ctx: ToolContext, draftId: string): Promise<Draft | undefined> {
+  const draft = await ctx.store.get<Draft>(draftKey(draftId));
+  // Same answer for "missing" and "not yours", so we don't leak which IDs exist.
+  return draft?.owner === ctx.principal ? draft : undefined;
+}
+
+async function addNote(args: Record<string, any>, ctx: ToolContext) {
+  if (typeof args.text !== "string" || args.text.trim() === "") return toolError("`text` must be a non-empty string");
+
+  // The handle replaces the session. The model sees it and passes it back.
+  const draftId: string = args.draft_id ?? randomUUID();
+  let draft: Draft = { owner: ctx.principal, notes: [] };
+
+  if (args.draft_id !== undefined) {
+    const existing = await loadOwnDraft(ctx, draftId);
+    if (!existing) return toolError(`No draft "${draftId}" found. Omit draft_id to start a new one.`);
+    draft = existing;
+  }
+
+  draft.notes.push(args.text);
+  await ctx.store.set(draftKey(draftId), draft);
+  return textContent(`draft_id=${draftId}, ${draft.notes.length} note(s)`);
+}
+
+async function publishNotes(args: Record<string, any>, ctx: ToolContext) {
+  const { draft_id: draftId, idempotency_key: idemKey } = args;
+  if (typeof draftId !== "string" || typeof idemKey !== "string") {
+    return toolError("`draft_id` and `idempotency_key` are required strings");
+  }
+
+  // Scope keys per caller, so one user can't "use up" another user's key.
+  const doneKey = `published:${ctx.principal}:${idemKey}`;
+
+  // 1. Seen this key before? Then this is a retry. Don't post again.
+  //    Checked FIRST, because the draft is already deleted after a success.
+  if (await ctx.store.get(doneKey)) return textContent("Already published (same idempotency_key). Nothing posted again.");
+
+  // 2. Check the caller can actually publish this draft.
+  const draft = await loadOwnDraft(ctx, draftId);
+  if (!draft) return toolError(`No draft "${draftId}" found.`);
+
+  // 3. Claim the key atomically. If two retries race, only one wins.
+  const claimed = await ctx.store.setIfAbsent(doneKey, true);
+  if (!claimed) return textContent("Already published (same idempotency_key). Nothing posted again.");
+
+  // 4. Do the side effect. If it fails, release the claim so a retry can try again.
+  try {
+    await ctx.channel.post(draft.notes.join("\n"));
+  } catch (err) {
+    await ctx.store.delete(doneKey);
+    throw err;
+  }
+
+  await ctx.store.delete(draftKey(draftId));
+  return textContent(`Published ${draft.notes.length} note(s)`);
+}
+
+const handlers: Record<string, (args: Record<string, any>, ctx: ToolContext) => Promise<object>> = {
+  add_note: addNote,
+  publish_notes: publishNotes,
+};
+
+/** Run a tool by name. Returns undefined if no such tool exists. */
+export async function callTool(name: string, args: Record<string, any>, ctx: ToolContext): Promise<object | undefined> {
+  const handler = handlers[name];
+  return handler ? handler(args, ctx) : undefined;
+}
