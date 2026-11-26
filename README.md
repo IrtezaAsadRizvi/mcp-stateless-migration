@@ -8,7 +8,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-0-2EA44F?style=flat-square)](package.json)
 [![No SDK](https://img.shields.io/badge/MCP%20SDK-none%2C%20written%20by%20hand-F08C00?style=flat-square)](#faq)
-[![Tests](https://img.shields.io/badge/tests-9%20passing-2EA44F?style=flat-square&logo=nodedotjs&logoColor=white)](test/v2.test.ts)
+[![Tests](https://img.shields.io/badge/tests-10%20passing-2EA44F?style=flat-square&logo=nodedotjs&logoColor=white)](test)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-2EA44F?style=flat-square)](#contributing)
 [![GitHub stars](https://img.shields.io/github/stars/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square&logo=github)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/commits)
@@ -22,7 +22,7 @@ This repository is the companion code for the article **[MCP Went Stateless. Her
 - ✅ Before and after: a stateful MCP server (spec `2025-11-25`) and its stateless rewrite (spec `2026-07-28`)
 - ✅ A live demo with 3 replicas behind a round-robin load balancer, showing the old server fail and the new one work
 - ✅ Fixes for the "silent" stateless bugs: idempotency keys for retries, owner-bound handles, header validation
-- ✅ 9 tests, each one checking a claim from the article
+- ✅ 10 tests, each one checking a claim from the article (plus a reader-reported failure case)
 
 ---
 
@@ -82,7 +82,7 @@ Now run the two demos and the tests:
 ```bash
 npm run demo:v1   # the stateful server breaking behind a load balancer
 npm run demo:v2   # the stateless server working behind the same load balancer
-npm test          # 9 tests, one per claim in the article
+npm test          # 10 tests: the claims from the article, plus a failure case
 ```
 
 All available commands:
@@ -173,7 +173,7 @@ Expected output:
 
 ### 5. Read the tests
 
-[`test/v2.test.ts`](test/v2.test.ts) has one test per claim, named in plain English, for example *"retrying publish with the same idempotency key posts only once"*. It fires two retries at the same time to prove the guard holds under a race.
+[`test/v2.test.ts`](test/v2.test.ts) has one test per claim, named in plain English, for example *"retrying publish with the same idempotency key posts only once"*. It fires two retries at the same time to prove the guard holds under a race. [`test/publish-failure.test.ts`](test/publish-failure.test.ts) uses a channel that fails once after 300 ms, to check that a failed post is reported honestly and never crashes the server.
 
 ## Talk to the server with curl
 
@@ -254,11 +254,18 @@ Stream resumability (`Last-Event-ID`) was removed. If a connection drops mid-req
 
 **The fix:** `publish_notes` requires an `idempotency_key`. The server:
 
-1. Checks whether that key was already used. If so, it replies "Already published".
-2. Claims the key with an atomic `setIfAbsent`, so two retries racing each other can't both win.
-3. Posts. If posting fails, it releases the claim so a later retry can succeed.
+1. Checks whether that key was already used. The key records one of two states:
+   - `done`: the post succeeded, so the retry gets "Already published".
+   - `pending`: another call is posting right now, so the retry gets "Still in progress, retry shortly".
+2. Claims the key as `pending` with an atomic `setIfAbsent`, so two retries racing each other can't both post.
+3. Posts. If posting fails, it releases the key and returns a tool error saying nothing was posted, so a later retry with the same key can succeed.
+4. Only after a successful post does it mark the key `done`.
 
 Keys are scoped per user, so one user can't use up another user's key.
+
+**Why two states and not one?** An earlier version stored a single "claimed" flag. A reader showed that a retry landing *while* the first call was still posting heard "Already published", and if that post then failed, the client believed something that never happened. Worse, the failure escaped as an unhandled rejection and crashed the replica. The `pending`/`done` split fixes the first problem; a `try/catch` around every tool call in [`server.ts`](src/v2-stateless/server.ts) fixes the second. [`test/publish-failure.test.ts`](test/publish-failure.test.ts) reproduces the exact scenario.
+
+**Known limit:** if a replica crashes mid-post, its key stays `pending` and that key can't be used again. That's deliberate: we can't tell whether the post went out, and not posting is safer than posting twice. In production, give `pending` keys an expiry (Redis `EX`) so a stuck key eventually clears, and pick the expiry with your channel's own duplicate tolerance in mind.
 
 ### Handles leak
 
@@ -317,7 +324,8 @@ demo/
   run-v1.ts          The v1 demo
   run-v2.ts          The v2 demo
 test/
-  v2.test.ts         One test per claim in the article
+  v2.test.ts                One test per claim in the article
+  publish-failure.test.ts   A channel that fails mid-post (reader-reported bug)
 ```
 
 ## FAQ

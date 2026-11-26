@@ -74,6 +74,21 @@ async function addNote(args: Record<string, any>, ctx: ToolContext) {
   return textContent(`draft_id=${draftId}, ${draft.notes.length} note(s)`);
 }
 
+/**
+ * What an idempotency key records. Two states, not one:
+ * "pending" = a call is posting right now, "done" = the post succeeded.
+ * With a single "claimed" flag, a retry arriving mid-post would hear
+ * "already published" even if that post then failed.
+ */
+type PublishStatus = { status: "pending" | "done" };
+
+/** The reply a retry gets, based on what its key says. */
+function retryReply(record: PublishStatus) {
+  return record.status === "done"
+    ? textContent("Already published (same idempotency_key). Nothing posted again.")
+    : textContent("Still in progress: another call with this idempotency_key is publishing. Retry with the same key shortly.");
+}
+
 async function publishNotes(args: Record<string, any>, ctx: ToolContext) {
   const { draft_id: draftId, idempotency_key: idemKey } = args;
   if (typeof draftId !== "string" || typeof idemKey !== "string") {
@@ -81,28 +96,39 @@ async function publishNotes(args: Record<string, any>, ctx: ToolContext) {
   }
 
   // Scope keys per caller, so one user can't "use up" another user's key.
-  const doneKey = `published:${ctx.principal}:${idemKey}`;
+  const idemStoreKey = `publish:${ctx.principal}:${idemKey}`;
 
-  // 1. Seen this key before? Then this is a retry. Don't post again.
+  // 1. Seen this key before? Then this is a retry: report, don't post.
   //    Checked FIRST, because the draft is already deleted after a success.
-  if (await ctx.store.get(doneKey)) return textContent("Already published (same idempotency_key). Nothing posted again.");
+  const existing = await ctx.store.get<PublishStatus>(idemStoreKey);
+  if (existing) return retryReply(existing);
 
   // 2. Check the caller can actually publish this draft.
   const draft = await loadOwnDraft(ctx, draftId);
   if (!draft) return toolError(`No draft "${draftId}" found.`);
 
-  // 3. Claim the key atomically. If two retries race, only one wins.
-  const claimed = await ctx.store.setIfAbsent(doneKey, true);
-  if (!claimed) return textContent("Already published (same idempotency_key). Nothing posted again.");
+  // 3. Claim the key atomically as "pending". If two retries race, only one wins.
+  const claimed = await ctx.store.setIfAbsent(idemStoreKey, { status: "pending" });
+  if (!claimed) {
+    const winner = await ctx.store.get<PublishStatus>(idemStoreKey);
+    if (winner) return retryReply(winner);
+    // The winner already failed and released the key. Let the client try again.
+    return toolError("A concurrent publish with this idempotency_key just failed. Retry with the same key.");
+  }
 
-  // 4. Do the side effect. If it fails, release the claim so a retry can try again.
+  // 4. Do the side effect. If it fails, release the claim and say so plainly.
+  //    Nothing was posted, so retrying with the same key is safe.
   try {
     await ctx.channel.post(draft.notes.join("\n"));
   } catch (err) {
-    await ctx.store.delete(doneKey);
-    throw err;
+    await ctx.store.delete(idemStoreKey);
+    console.error(`publish_notes failed for key "${idemKey}":`, err);
+    return toolError("Publishing failed and nothing was posted. Retry with the same idempotency_key.");
   }
 
+  // 5. Only now mark it done. A crash before this line leaves the key "pending",
+  //    which blocks re-posting: we'd rather not post than post twice.
+  await ctx.store.set(idemStoreKey, { status: "done" });
   await ctx.store.delete(draftKey(draftId));
   return textContent(`Published ${draft.notes.length} note(s)`);
 }

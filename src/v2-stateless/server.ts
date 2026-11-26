@@ -7,7 +7,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
-import { readJsonRpc, sendJson, METHOD_NOT_FOUND, INVALID_PARAMS, PARSE_ERROR } from "../shared/jsonrpc.ts";
+import { readJsonRpc, sendJson, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR, PARSE_ERROR } from "../shared/jsonrpc.ts";
 import { ConsoleChannel, type Channel } from "../shared/channel.ts";
 import { checkRoutingHeaders, checkVersion, SUPPORTED_VERSIONS } from "./protocol.ts";
 import { callTool, toolDefinitions } from "./tools.ts";
@@ -81,7 +81,17 @@ export function createV2Server(options: V2Options = {}): Server {
 
     if (msg.method === "tools/call") {
       const { name, arguments: args = {} } = msg.params ?? {};
-      const result = await callTool(name, args, { store, channel, principal });
+
+      // Safety net: an unexpected error must become a JSON-RPC error,
+      // never an unhandled rejection that takes the whole replica down.
+      let result: object | undefined;
+      try {
+        result = await callTool(name, args, { store, channel, principal });
+      } catch (err) {
+        console.error(`tools/call ${name} threw:`, err);
+        return fail(INTERNAL_ERROR, "Internal error");
+      }
+
       if (!result) return fail(INVALID_PARAMS, `Unknown tool: ${name}`);
       return reply(result);
     }
