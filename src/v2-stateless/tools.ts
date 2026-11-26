@@ -3,7 +3,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { Store } from "./store.ts";
-import type { Channel } from "../shared/channel.ts";
+import { ChannelRejectedError, type Channel } from "../shared/channel.ts";
 import { textContent } from "../shared/jsonrpc.ts";
 
 /** Everything a tool needs. Note: nothing here is per-connection. */
@@ -29,11 +29,11 @@ export const toolDefinitions = [
   },
   {
     name: "publish_notes",
-    description: "Publish a draft. Reusing an idempotency_key never publishes twice, so retries are safe.",
+    description: "Publish a draft. A draft is published at most once, so calling this again is always safe.",
     inputSchema: {
       type: "object",
-      properties: { draft_id: { type: "string" }, idempotency_key: { type: "string" } },
-      required: ["draft_id", "idempotency_key"],
+      properties: { draft_id: { type: "string" } },
+      required: ["draft_id"],
     },
   },
 ];
@@ -75,32 +75,42 @@ async function addNote(args: Record<string, any>, ctx: ToolContext) {
 }
 
 /**
- * What an idempotency key records. Two states, not one:
- * "pending" = a call is posting right now, "done" = the post succeeded.
- * With a single "claimed" flag, a retry arriving mid-post would hear
- * "already published" even if that post then failed.
+ * Who makes the idempotency key? Not the model. If the model writes it, a re-planned
+ * retry can arrive with a fresh key and post twice. A draft is published at most once,
+ * so the draft itself is the key: the server derives it, and the model can't get it wrong.
+ *
+ * What the key records:
+ *   "pending" = a call is posting this draft right now
+ *   "done"    = the post succeeded
+ *   "unknown" = the post failed in a way that means it MAY have landed (e.g. a timeout)
+ * We never re-post an "unknown" draft: a duplicate is worse than asking a human to check.
  */
-type PublishStatus = { status: "pending" | "done" };
+type PublishStatus = { status: "pending" | "done" | "unknown" };
 
-/** The reply a retry gets, based on what its key says. */
+const RETRY_REPLIES = {
+  done: "Already published. Nothing posted again.",
+  pending: "Still in progress: this draft is being published right now. Check again shortly.",
+  unknown:
+    "Outcome unknown: an earlier attempt to publish this draft failed after the notes may have been posted. " +
+    "Nothing posted again. Check the channel; to post anyway, start a new draft.",
+};
+
+/** The reply a retry gets, based on what the key says. */
 function retryReply(record: PublishStatus) {
-  return record.status === "done"
-    ? textContent("Already published (same idempotency_key). Nothing posted again.")
-    : textContent("Still in progress: another call with this idempotency_key is publishing. Retry with the same key shortly.");
+  return record.status === "unknown" ? toolError(RETRY_REPLIES.unknown) : textContent(RETRY_REPLIES[record.status]);
 }
 
 async function publishNotes(args: Record<string, any>, ctx: ToolContext) {
-  const { draft_id: draftId, idempotency_key: idemKey } = args;
-  if (typeof draftId !== "string" || typeof idemKey !== "string") {
-    return toolError("`draft_id` and `idempotency_key` are required strings");
-  }
+  const { draft_id: draftId } = args;
+  if (typeof draftId !== "string") return toolError("`draft_id` is required");
 
-  // Scope keys per caller, so one user can't "use up" another user's key.
-  const idemStoreKey = `publish:${ctx.principal}:${idemKey}`;
+  // The key comes from the draft, never from the caller. Scoped per user so one
+  // user can't learn about, or block, another user's drafts.
+  const publishKey = `publish:${ctx.principal}:${draftId}`;
 
-  // 1. Seen this key before? Then this is a retry: report, don't post.
-  //    Checked FIRST, because the draft is already deleted after a success.
-  const existing = await ctx.store.get<PublishStatus>(idemStoreKey);
+  // 1. Already tried this draft? Then this is a retry: report, don't post.
+  //    Checked FIRST, because the draft is deleted after a success.
+  const existing = await ctx.store.get<PublishStatus>(publishKey);
   if (existing) return retryReply(existing);
 
   // 2. Check the caller can actually publish this draft.
@@ -108,27 +118,38 @@ async function publishNotes(args: Record<string, any>, ctx: ToolContext) {
   if (!draft) return toolError(`No draft "${draftId}" found.`);
 
   // 3. Claim the key atomically as "pending". If two retries race, only one wins.
-  const claimed = await ctx.store.setIfAbsent(idemStoreKey, { status: "pending" });
+  const claimed = await ctx.store.setIfAbsent(publishKey, { status: "pending" });
   if (!claimed) {
-    const winner = await ctx.store.get<PublishStatus>(idemStoreKey);
+    const winner = await ctx.store.get<PublishStatus>(publishKey);
     if (winner) return retryReply(winner);
     // The winner already failed and released the key. Let the client try again.
-    return toolError("A concurrent publish with this idempotency_key just failed. Retry with the same key.");
+    return toolError("A concurrent publish of this draft just failed. Call publish_notes again.");
   }
 
-  // 4. Do the side effect. If it fails, release the claim and say so plainly.
-  //    Nothing was posted, so retrying with the same key is safe.
+  // 4. Do the side effect. A failure is one of two very different things.
   try {
     await ctx.channel.post(draft.notes.join("\n"));
   } catch (err) {
-    await ctx.store.delete(idemStoreKey);
-    console.error(`publish_notes failed for key "${idemKey}":`, err);
-    return toolError("Publishing failed and nothing was posted. Retry with the same idempotency_key.");
+    console.error(`publish_notes failed for draft "${draftId}":`, err);
+
+    // The channel says it never sent anything: release the key so a retry can post.
+    if (err instanceof ChannelRejectedError) {
+      await ctx.store.delete(publishKey);
+      return toolError("Publishing failed and nothing was posted. Call publish_notes again to retry.");
+    }
+
+    // Anything else (a timeout, a dropped connection) may have landed. Don't guess:
+    // mark it so no retry can post twice, and keep the draft so a human can decide.
+    await ctx.store.set(publishKey, { status: "unknown" });
+    return toolError(
+      "Publishing failed, and the notes may or may not have been posted. " +
+        "Check the channel before doing anything else. Retrying this draft will not post.",
+    );
   }
 
   // 5. Only now mark it done. A crash before this line leaves the key "pending",
   //    which blocks re-posting: we'd rather not post than post twice.
-  await ctx.store.set(idemStoreKey, { status: "done" });
+  await ctx.store.set(publishKey, { status: "done" });
   await ctx.store.delete(draftKey(draftId));
   return textContent(`Published ${draft.notes.length} note(s)`);
 }

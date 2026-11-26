@@ -8,7 +8,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-0-2EA44F?style=flat-square)](package.json)
 [![No SDK](https://img.shields.io/badge/MCP%20SDK-none%2C%20written%20by%20hand-F08C00?style=flat-square)](#faq)
-[![Tests](https://img.shields.io/badge/tests-10%20passing-2EA44F?style=flat-square&logo=nodedotjs&logoColor=white)](test)
+[![Tests](https://img.shields.io/badge/tests-12%20passing-2EA44F?style=flat-square&logo=nodedotjs&logoColor=white)](test)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-2EA44F?style=flat-square)](#contributing)
 [![GitHub stars](https://img.shields.io/github/stars/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square&logo=github)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/IrtezaAsadRizvi/mcp-stateless-migration?style=flat-square)](https://github.com/IrtezaAsadRizvi/mcp-stateless-migration/commits)
@@ -21,8 +21,8 @@ This repository is the companion code for the article **[MCP Went Stateless. Her
 - ✅ Runnable in under a minute: Node 22.18+, no build step, zero runtime dependencies
 - ✅ Before and after: a stateful MCP server (spec `2025-11-25`) and its stateless rewrite (spec `2026-07-28`)
 - ✅ A live demo with 3 replicas behind a round-robin load balancer, showing the old server fail and the new one work
-- ✅ Fixes for the "silent" stateless bugs: idempotency keys for retries, owner-bound handles, header validation
-- ✅ 10 tests, each one checking a claim from the article (plus a reader-reported failure case)
+- ✅ Fixes for the "silent" stateless bugs: server-side idempotency keys for retries, owner-bound handles, header validation
+- ✅ 12 tests, each one checking a claim from the article (plus three reader-reported failure cases)
 
 ---
 
@@ -82,7 +82,7 @@ Now run the two demos and the tests:
 ```bash
 npm run demo:v1   # the stateful server breaking behind a load balancer
 npm run demo:v2   # the stateless server working behind the same load balancer
-npm test          # 10 tests: the claims from the article, plus a failure case
+npm test          # 12 tests: the claims from the article, plus three failure cases
 ```
 
 All available commands:
@@ -153,7 +153,7 @@ Expected output:
 [replica C] add_note (with draft_id)            -> draft_id=1f3a15ae-..., 2 note(s)
 [replica A] bob tries alice's draft_id          -> No draft "1f3a15ae-..." found.
 [replica B] publish_notes                       -> Published 2 note(s)
-[replica C] publish_notes (retry, same key)     -> Already published (same idempotency_key). Nothing posted again.
+[replica C] publish_notes (retry)                -> Already published. Nothing posted again.
 [replica A] Mcp-Name header lies about the tool -> error -32020: Mcp-Name header does not match the request body
 [replica B] old protocol version                -> error -32022: Unsupported protocol version "2025-11-25". ...
 
@@ -167,13 +167,13 @@ Expected output:
 3. **`add_note` with the `draft_id`** lands on replica C, which finds the draft in the same store. No sticky sessions needed.
 4. **Bob uses Alice's `draft_id`** and gets "not found". Handles show up in prompts and logs, so they can't be treated as permission.
 5. **`publish_notes`** posts once.
-6. **The retry** with the same `idempotency_key` is recognised, and nothing is posted twice.
+6. **The retry** of the same draft is recognised, and nothing is posted twice. The draft itself is the idempotency key, so even a model that invents new arguments can't cause a duplicate.
 7. **A lying `Mcp-Name` header** (says `add_note`, body says `publish_notes`) is rejected, so a gateway can't be tricked.
 8. **An old client** speaking `2025-11-25` gets a clear version error.
 
 ### 5. Read the tests
 
-[`test/v2.test.ts`](test/v2.test.ts) has one test per claim, named in plain English, for example *"retrying publish with the same idempotency key posts only once"*. It fires two retries at the same time to prove the guard holds under a race. [`test/publish-failure.test.ts`](test/publish-failure.test.ts) uses a channel that fails once after 300 ms, to check that a failed post is reported honestly and never crashes the server.
+[`test/v2.test.ts`](test/v2.test.ts) has one test per claim, named in plain English, for example *"retrying publish of the same draft posts only once"*. It fires two retries at the same time to prove the guard holds under a race. [`test/publish-failure.test.ts`](test/publish-failure.test.ts) uses misbehaving channels (one that refuses a post, one that accepts it and then times out, one that is just slow) to check that failures are reported honestly, never crash the server, and never cause a double post, even when the model retries with a new key.
 
 ## Talk to the server with curl
 
@@ -221,7 +221,7 @@ mcp alice tools/call add_note '{"name":"add_note","arguments":{"text":"Fixed log
 mcp alice tools/call add_note '{"name":"add_note","arguments":{"text":"Faster builds","draft_id":"DRAFT_ID"}}'
 
 # 4. Publish. Watch the server terminal: the notes are posted once.
-mcp alice tools/call publish_notes '{"name":"publish_notes","arguments":{"draft_id":"DRAFT_ID","idempotency_key":"release-1"}}'
+mcp alice tools/call publish_notes '{"name":"publish_notes","arguments":{"draft_id":"DRAFT_ID"}}'
 
 # 5. Run step 4 again. This is what a client does after a dropped connection.
 #    You get "Already published", and nothing is posted a second time.
@@ -252,26 +252,55 @@ The stateless spec makes some failures silent. The article's v2 code left two of
 
 Stream resumability (`Last-Event-ID`) was removed. If a connection drops mid-request, the request is lost, and the client sends it again with a new ID. Your tests pass, but in production `publish_notes` can post twice.
 
-**The fix:** `publish_notes` requires an `idempotency_key`. The server:
+**The fix:** an idempotency key, created by the **server**, not the model.
 
-1. Checks whether that key was already used. The key records one of two states:
+**Who creates the key matters.** If the model writes the key as a tool argument, nothing makes it reuse the same one. After a dropped stream, an agent that re-plans can call `publish_notes` again with a brand new key, and the server sees a "new" request and posts twice. So `publish_notes` takes no key at all. A draft is published at most once, so **the draft itself is the key**: the server derives it from `draft_id`, and whatever the model does, a second publish of the same draft is a retry.
+
+> **Rule of thumb:** derive the idempotency key from something the operation naturally owns (a draft, an order, a cart). If there's no natural ID, have your *client code* (not the model) mint the key and send it in `_meta`, where a re-planning model can't change it.
+
+For each draft, the server:
+
+1. Checks whether that draft was already published. The key records one of three states:
    - `done`: the post succeeded, so the retry gets "Already published".
-   - `pending`: another call is posting right now, so the retry gets "Still in progress, retry shortly".
+   - `pending`: another call is posting right now, so the retry gets "Still in progress".
+   - `unknown`: an earlier attempt failed in a way that means the post *may* have landed, so the retry gets "Outcome unknown, check the channel" and nothing is posted.
 2. Claims the key as `pending` with an atomic `setIfAbsent`, so two retries racing each other can't both post.
-3. Posts. If posting fails, it releases the key and returns a tool error saying nothing was posted, so a later retry with the same key can succeed.
+3. Posts. If posting fails, what happens next depends on *how* it failed (see below).
 4. Only after a successful post does it mark the key `done`.
 
-Keys are scoped per user, so one user can't use up another user's key.
+Keys are scoped per user, so one user can't learn about or block another user's drafts.
 
-**Why two states and not one?** An earlier version stored a single "claimed" flag. A reader showed that a retry landing *while* the first call was still posting heard "Already published", and if that post then failed, the client believed something that never happened. Worse, the failure escaped as an unhandled rejection and crashed the replica. The `pending`/`done` split fixes the first problem; a `try/catch` around every tool call in [`server.ts`](src/v2-stateless/server.ts) fixes the second. [`test/publish-failure.test.ts`](test/publish-failure.test.ts) reproduces the exact scenario.
+**A failed call doesn't mean nothing happened.** There are two kinds of failure, and they need opposite handling:
 
-**Known limit:** if a replica crashes mid-post, its key stays `pending` and that key can't be used again. That's deliberate: we can't tell whether the post went out, and not posting is safer than posting twice. In production, give `pending` keys an expiry (Redis `EX`) so a stuck key eventually clears, and pick the expiry with your channel's own duplicate tolerance in mind.
+| How the post failed | Did it land? | What the server does |
+|---|---|---|
+| The channel refused it (e.g. a 4xx, connection refused). The channel throws `ChannelRejectedError`. | **No**, definitely | Releases the key and says "nothing was posted". Publishing the draft again posts once. |
+| Anything else: a timeout, a dropped connection after sending | **Maybe** | Marks the key `unknown` and says the notes "may or may not have been posted". Publishing the same draft again won't post. To post anyway, someone deliberately starts a new draft. |
+
+Only the channel can tell these apart, which is why the [`Channel`](src/shared/channel.ts) interface asks implementations to throw `ChannelRejectedError` *only* when they know nothing was sent. Every other error is treated as "maybe".
+
+**How this design got here.** Readers found three problems in earlier versions:
+
+1. A single "claimed" flag let a retry landing *while* the first call was still posting hear "Already published", even if that post then failed. Worse, the failure escaped as an unhandled rejection and crashed the replica. Fixed by the `pending`/`done` split and a `try/catch` around every tool call in [`server.ts`](src/v2-stateless/server.ts).
+2. A fake Slack that accepted the message and then timed out was told "nothing was posted", and the retry posted a second time. Fixed by the `unknown` state above.
+3. The model supplied the `idempotency_key`, so a re-planned retry could arrive with a fresh key and post twice. Fixed by deriving the key from the draft on the server.
+
+[`test/publish-failure.test.ts`](test/publish-failure.test.ts) reproduces all three scenarios.
+
+**Known limit:** if a replica crashes mid-post, its key stays `pending` and that key can't be used again. Same reasoning as `unknown`: we can't tell whether the post went out, and not posting is safer than posting twice. In production, give `pending` keys an expiry (Redis `EX`) so a stuck key eventually clears, and pick the expiry with your channel's own duplicate tolerance in mind. If your channel supports its own idempotency key (many payment APIs do), pass yours through and most of this ambiguity disappears.
 
 ### Handles leak
 
 A `draft_id` ends up in prompts, transcripts and logs. Anyone who sees it shouldn't be able to use it.
 
 **The fix:** every draft records its `owner`. Only that user can add to it or publish it. "Not yours" and "doesn't exist" get the same reply, so nobody can probe for valid IDs.
+
+**Should handles be signed?** Often, yes. A signed handle (an HMAC over the ID, the owner and an expiry, using a secret every replica shares) lets any replica reject a forged, expired or someone-else's handle *without touching the store*. This repo doesn't sign `draft_id`, for one reason: the handle points at data (the notes) that lives in the store, so every valid call reads the store anyway, and the ownership check comes free with that read. Signing earns its keep when:
+
+- the handle *carries* the state itself (a pagination cursor, a small piece of workflow state), so there's nothing to look up, or
+- you want to turn away junk and expired handles before they cost a database round trip.
+
+If you do sign, keep the owner check on use: a signature proves the server issued the handle, not that the caller is allowed to use it.
 
 ### Headers can disagree with the body
 
@@ -296,7 +325,7 @@ This repo is built for learning. Before using the pattern in a real server:
   }
   ```
 
-  Also set an expiry (`EX`) on drafts and idempotency keys so they don't live forever.
+  Also set an expiry (`EX`) on drafts and publish keys so they don't live forever.
 
 - **Use real authentication.** `getPrincipal` in [`server.ts`](src/v2-stateless/server.ts) trusts the bearer token as the user name. Verify an OAuth or JWT token there instead.
 - **Use the official MCP SDK.** The v2 TypeScript SDK handles steps 1, 2, 4 and 5 for you. Handles (step 3) and idempotency keys are still your job.
@@ -325,7 +354,7 @@ demo/
   run-v2.ts          The v2 demo
 test/
   v2.test.ts                One test per claim in the article
-  publish-failure.test.ts   A channel that fails mid-post (reader-reported bug)
+  publish-failure.test.ts   Channels that fail mid-post (reader-reported bugs)
 ```
 
 ## FAQ
@@ -353,6 +382,14 @@ Yes. With stateless MCP, plain round robin works without sticky sessions, as lon
 ### Why do I need idempotency keys in stateless MCP?
 
 Because dropped streams can no longer be resumed. The client retries with a new request ID, so any tool with a side effect (posting a message, charging a card) can run twice unless it recognises the retry.
+
+### Who should create the idempotency key, the model or the server?
+
+Not the model. If the key is a tool argument the model writes, a model that re-plans after a dropped stream can send a fresh key and trigger a duplicate. Derive the key on the server from something the operation owns (here, the `draft_id`), or have the client code mint it and send it in `_meta`.
+
+### Should MCP handles be signed?
+
+Signing a handle with the owner and an expiry lets any replica reject forged or expired handles without a database lookup. It's most useful when the handle carries state itself. If the handle points at data in a shared store, you read the store anyway, so a plain random ID plus an owner check is enough. Either way, still check the caller is allowed to use it.
 
 ### What are the `Mcp-Method` and `Mcp-Name` headers?
 

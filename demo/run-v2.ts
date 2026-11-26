@@ -33,13 +33,13 @@ log("add_note (with draft_id)", await v2(url, "alice", "tools/call", {
 // 3. Gotcha #2: a leaked draft_id is not a key. Bob can't touch Alice's draft.
 log("bob tries alice's draft_id", await v2(url, "bob", "tools/call", {
   name: "publish_notes",
-  arguments: { draft_id: draftId, idempotency_key: "bob-1" },
+  arguments: { draft_id: draftId },
 }));
 
-// 4. Publish, then RETRY with the same idempotency key (gotcha #1: dropped stream).
-const publish = { name: "publish_notes", arguments: { draft_id: draftId, idempotency_key: "release-42" } };
+// 4. Publish, then RETRY (gotcha #1: dropped stream). The draft itself is the idempotency key.
+const publish = { name: "publish_notes", arguments: { draft_id: draftId } };
 log("publish_notes", await v2(url, "alice", "tools/call", publish));
-log("publish_notes (retry, same key)", await v2(url, "alice", "tools/call", publish));
+log("publish_notes (retry)", await v2(url, "alice", "tools/call", publish));
 
 // 5. A lying header: says add_note, body says publish_notes. Rejected.
 log("Mcp-Name header lies about the tool", await post(url, "tools/call", publish, {

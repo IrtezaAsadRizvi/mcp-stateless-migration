@@ -36,10 +36,10 @@ test("a draft built across different replicas keeps all its notes", async () => 
   assert.match(summary(res), /2 note\(s\)/);
 });
 
-test("retrying publish with the same idempotency key posts only once", async () => {
+test("retrying publish of the same draft posts only once", async () => {
   const draftId = await newDraft("alice");
   const before = channel.posts.length;
-  const call = { name: "publish_notes", arguments: { draft_id: draftId, idempotency_key: "k-1" } };
+  const call = { name: "publish_notes", arguments: { draft_id: draftId } };
 
   // Fire two retries at once to prove the atomic claim works, then a late third one.
   await Promise.all([v2(cluster.url, "alice", "tools/call", call), v2(cluster.url, "alice", "tools/call", call)]);
@@ -53,7 +53,7 @@ test("a leaked draft_id does not let another user publish it", async () => {
   const draftId = await newDraft("alice");
   const res = await v2(cluster.url, "mallory", "tools/call", {
     name: "publish_notes",
-    arguments: { draft_id: draftId, idempotency_key: "m-1" },
+    arguments: { draft_id: draftId },
   });
   assert.equal(res.body.result.isError, true);
 });
